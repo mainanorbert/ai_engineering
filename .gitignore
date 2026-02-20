@@ -1,0 +1,88 @@
+# ============================
+# Python bytecode & caches
+# ============================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ============================
+# Virtual environments
+# ============================
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.miniconda/
+
+# ============================
+# Jupyter / IPython
+# ============================
+.ipynb_checkpoints/
+.profile_default/
+.ipython/
+
+# ============================
+# Environment variables & secrets
+# ============================
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# ============================
+# OS-specific files
+# ============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================
+# Editor / IDE files
+# ============================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============================
+# Logs & runtime artifacts
+# ============================
+*.log
+logs/
+tmp/
+.cache/
+
+# ============================
+# Build / distribution
+# ============================
+build/
+dist/
+*.egg-info/
+
+# ============================
+# Test & coverage artifacts
+# ============================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ============================
+# LLM / Model Artifacts
+# ============================
+models/
+*.gguf
+*.bin
+
+# ============================
+# Local databases
+# ============================
+*.sqlite3
+*.db
+
+# ============================
+# API dumps / debug traces
+# ============================
+responses.json
+debug/
