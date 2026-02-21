@@ -86,3 +86,9 @@ models/
 # ============================
 responses.json
 debug/
+
+# ============================
+# Generated brochures
+# ============================
+brochures/
+*.pdf
