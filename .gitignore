@@ -95,4 +95,4 @@ brochures/
 week2/audio/
 week2/images/
 
-myfiles/
+myfiles/*.joblib
