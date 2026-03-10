@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Tuple
 
 from agents.scraper_agent import ScraperAgent
 from agents.pricing_agent import PricingAgent
+from agents.messaging_agent import MessagingAgent
 
 
 VERDICT_EMOJI = {
@@ -60,6 +61,7 @@ class PlanningAgent:
         self.log("Initialising sub-agents…")
         self.scraper = ScraperAgent()
         self.pricer  = PricingAgent()
+        self.messenger = MessagingAgent()
         self.log("All sub-agents ready.")
 
     def log(self, message: str) -> None:
@@ -156,6 +158,13 @@ class PlanningAgent:
 
         self.log("Step 2/2 — estimating prices…")
         enriched = self.pricer.enrich(products)
+
+        self.log("Step 3/3 — sending notification…")
+        best_deal = self.messenger._find_best_deal(enriched)
+        notification = self.messenger._craft_message(best_deal)
+        self.messenger.push(notification)
+        self.log("Notification sent.")
+
         self.log("Pipeline complete.")
 
         summary = self._build_summary(enriched, query)
