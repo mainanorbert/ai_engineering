@@ -1,13 +1,14 @@
 """
 LLM answer-generation layer for the medi_llm RAG agent.
 
-Grounding rule: the LLM is only allowed to answer from the retrieved context.
-If the retrieved chunks do not contain relevant information the function returns
-the standard "no information" message without hallucinating.
+Behavior:
+    1. Prefer knowledge-base grounded answers when relevant context is available.
+    2. If KB context is missing/insufficient, fall back to general knowledge.
+    3. Clearly label fallback answers as general knowledge (not from KB).
 """
 
 from dataclasses import dataclass
-from typing import Generator, List, Optional, Tuple
+from typing import Generator, List
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -24,10 +25,11 @@ except ImportError:
 load_dotenv(override=True)
 
 NO_INFO_MESSAGE = "No such information is available in the medical knowledge base."
+GENERAL_KNOWLEDGE_PREFIX = "General medical knowledge (not from knowledge base):"
 RELEVANCE_SCORE_THRESHOLD = 0.0
 
 
-SYSTEM_PROMPT = """You are a knowledgeable medical information assistant specialising in respiratory
+KB_SYSTEM_PROMPT = """You are a knowledgeable medical information assistant specialising in respiratory
 viruses and the illnesses they cause (common cold, influenza, COVID-19, and RSV).
 
 You answer questions STRICTLY and ONLY from the provided knowledge-base context below.
@@ -42,6 +44,17 @@ Rules you must follow:
 
 Context from the knowledge base:
 {context}
+"""
+
+GENERAL_SYSTEM_PROMPT = """You are a knowledgeable medical information assistant specialising in respiratory
+viruses and the illnesses they cause (common cold, influenza, COVID-19, and RSV).
+
+You are answering from your general medical knowledge, not from a provided knowledge base.
+
+Rules you must follow:
+1. Be factual, concise, and directly relevant.
+2. Do not diagnose, prescribe, or give personalised medical advice.
+3. If uncertain, say so briefly.
 """
 
 
@@ -82,6 +95,30 @@ def _has_relevant_context(results: List[RetrievalResult]) -> bool:
     return False
 
 
+def _extract_answer_text(response) -> str:
+    return "".join(
+        block.text for block in response.content if hasattr(block, "text")
+    ).strip()
+
+
+def _answer_from_general_knowledge(
+    client: Anthropic,
+    question: str,
+    llm_model: str,
+    max_tokens: int,
+) -> str:
+    response = client.messages.create(
+        model=llm_model,
+        max_tokens=max_tokens,
+        system=GENERAL_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": question}],
+    )
+    text = _extract_answer_text(response)
+    if not text:
+        text = "I do not have enough confidence to answer from general knowledge right now."
+    return f"{GENERAL_KNOWLEDGE_PREFIX}\n\n{text}"
+
+
 # ----------------------------- Non-streaming -----------------------------
 
 def answer_question(
@@ -92,26 +129,35 @@ def answer_question(
 ) -> AnswerResult:
 
     results = search_knowledge_base(query=question, top_k=top_k)
+    client = Anthropic()
 
     if not _has_relevant_context(results):
-        return AnswerResult(question, NO_INFO_MESSAGE, [])
+        fallback_answer = _answer_from_general_knowledge(
+            client=client,
+            question=question,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+        )
+        return AnswerResult(question, fallback_answer, [])
 
     context = _build_context(results)
-    client = Anthropic()
 
     response = client.messages.create(
         model=llm_model,
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT.format(context=context),
+        system=KB_SYSTEM_PROMPT.format(context=context),
         messages=[{"role": "user", "content": question}],
     )
 
-    answer = "".join(
-        block.text for block in response.content if hasattr(block, "text")
-    ).strip()
+    answer = _extract_answer_text(response)
 
-    if not answer:
-        answer = NO_INFO_MESSAGE
+    if not answer or answer == NO_INFO_MESSAGE:
+        answer = _answer_from_general_knowledge(
+            client=client,
+            question=question,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+        )
 
     return AnswerResult(question, answer, results)
 
@@ -124,78 +170,41 @@ def answer_question_stream(
     llm_model: str = "claude-haiku-4-5",
     max_tokens: int = 1024,
 ):
-
+    """Stream the LLM answer token by token."""
     results = search_knowledge_base(query=question, top_k=top_k)
+    client = Anthropic()
 
     if not _has_relevant_context(results):
-        yield NO_INFO_MESSAGE
+        fallback_answer = _answer_from_general_knowledge(
+            client=client,
+            question=question,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+        )
+        partial = ""
+        for token in fallback_answer.split():
+            partial = f"{partial} {token}".strip()
+            yield partial
         return
 
     context = _build_context(results)
-    client = Anthropic()
-
-    partial = ""
-
-    with client.messages.stream(
+    response = client.messages.create(
         model=llm_model,
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT.format(context=context),
+        system=KB_SYSTEM_PROMPT.format(context=context),
         messages=[{"role": "user", "content": question}],
-    ) as stream:
+    )
+    kb_answer = _extract_answer_text(response)
 
-        for event in stream:
-            if getattr(event, "type", None) == "content_block_delta":
-                delta = getattr(event, "delta", None)
-
-                if delta and getattr(delta, "type", None) == "text_delta":
-                    text = getattr(delta, "text", "")
-                    if text:
-                        partial += text
-                        yield partial
-
-
-# ----------------------------- Streaming (WITH sources) -----------------------------
-
-def stream_answer_with_sources(
-    question: str,
-    top_k: int = DEFAULT_SETTINGS.default_top_k,
-    llm_model: str = "claude-haiku-4-5",
-    max_tokens: int = 1024,
-) -> Generator[Tuple[str, Optional[List[RetrievalResult]]], None, None]:
-
-    results = search_knowledge_base(query=question, top_k=top_k)
-
-    # No relevant context → return immediately
-    if not _has_relevant_context(results):
-        yield NO_INFO_MESSAGE, []
-        return
-
-    context = _build_context(results)
-    client = Anthropic()
+    if not kb_answer or kb_answer == NO_INFO_MESSAGE:
+        kb_answer = _answer_from_general_knowledge(
+            client=client,
+            question=question,
+            llm_model=llm_model,
+            max_tokens=max_tokens,
+        )
 
     partial = ""
-
-    with client.messages.stream(
-        model=llm_model,
-        max_tokens=max_tokens,
-        system=SYSTEM_PROMPT.format(context=context),
-        messages=[{"role": "user", "content": question}],
-    ) as stream:
-
-        for event in stream:
-            if getattr(event, "type", None) == "content_block_delta":
-                delta = getattr(event, "delta", None)
-
-                # Only process actual text tokens
-                if delta and getattr(delta, "type", None) == "text_delta":
-                    text = getattr(delta, "text", "")
-                    if text:
-                        partial += text
-                        yield partial, None
-
-    # Final fallback
-    if not partial.strip():
-        partial = NO_INFO_MESSAGE
-
-    # FINAL YIELD (CRITICAL)
-    yield partial, results
+    for token in kb_answer.split():
+        partial = f"{partial} {token}".strip()
+        yield partial

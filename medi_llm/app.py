@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import List
-
 import gradio as gr
 from dotenv import load_dotenv
 
@@ -9,14 +7,12 @@ try:
     from .config import DEFAULT_SETTINGS
     from .pipeline import build_knowledge_base
     from .vector_store import get_collection_count
-    from .llm import stream_answer_with_sources
-    from .schemas import RetrievalResult
+    from .llm import answer_question_stream
 except ImportError:
     from config import DEFAULT_SETTINGS
     from pipeline import build_knowledge_base
     from vector_store import get_collection_count
-    from llm import stream_answer_with_sources
-    from schemas import RetrievalResult
+    from llm import answer_question_stream
 
 load_dotenv(override=True)
 
@@ -28,12 +24,19 @@ _kb_ready = False
 
 def ensure_kb_ready() -> str:
     """Build the ChromaDB index if needed, then return a status string."""
+    import shutil
     global _kb_ready
     try:
         if _kb_ready:
             return f"OK: Knowledge base ready ({get_collection_count()} chunks indexed)"
 
-        count = get_collection_count()
+        try:
+            count = get_collection_count()
+        except Exception:
+            # Existing DB is unreadable (schema mismatch / corrupted) — wipe and rebuild
+            shutil.rmtree(DEFAULT_SETTINGS.vector_db_path, ignore_errors=True)
+            count = 0
+
         if count > 0:
             _kb_ready = True
             return f"OK: Knowledge base ready ({count} chunks indexed)"
@@ -45,7 +48,7 @@ def ensure_kb_ready() -> str:
             embedding_model_name=DEFAULT_SETTINGS.embedding_model_name,
             chunk_size=DEFAULT_SETTINGS.chunk_size,
             chunk_overlap=DEFAULT_SETTINGS.chunk_overlap,
-            reset_existing=False,
+            reset_existing=True,
         )
         _kb_ready = True
         return f"OK: Knowledge base built ({artifacts.indexed_chunk_count} chunks indexed)"
@@ -54,74 +57,17 @@ def ensure_kb_ready() -> str:
         return f"Warning: Knowledge base initialization failed: {exc}"
 
 
-# --- Gradio helper: source citations panel ------------------------------------
 
-_SCORE_COLORS = [
-    (5.0, "#16a34a"),   # green  - highly relevant
-    (2.0, "#2563eb"),   # blue   - relevant
-    (0.0, "#d97706"),   # amber  - marginally relevant
-    (-999, "#94a3b8"),  # grey   - low / unknown
-]
-
-
-def _score_color(score: float | None) -> str:
-    """Return a hex color based on the cross-encoder rerank score."""
-    if score is None:
-        return "#94a3b8"
-    for threshold, color in _SCORE_COLORS:
-        if score >= threshold:
-            return color
-    return "#94a3b8"
-
-
-def build_sources_html(sources: List[RetrievalResult]) -> str:
-    """Render retrieved chunks as an HTML citation panel."""
-    if not sources:
-        return (
-            "<p style='color:#94a3b8;font-size:0.85em;font-family:system-ui;"
-            "padding:12px 4px'>No sources retrieved.</p>"
-        )
-
-    cards = []
-    for i, result in enumerate(sources, start=1):
-        source = result.metadata.get("source", "unknown")
-        section = result.metadata.get("section_heading", "")
-        score = result.rerank_score
-        color = _score_color(score)
-        score_label = f"{score:.2f}" if score is not None else "n/a"
-        preview = result.text[:220].replace("<", "&lt;").replace(">", "&gt;")
-        if len(result.text) > 220:
-            preview += "..."
-
-        cards.append(
-            f"""
-<div style="background:#f8fafc;border:1px solid #e2e8f0;border-left:3px solid {color};
-            border-radius:8px;padding:10px 14px;margin-bottom:8px;font-family:system-ui">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
-    <span style="font-size:0.73em;color:#64748b;font-weight:600">[{i}] {source}</span>
-    <span style="background:{color};color:#fff;padding:1px 7px;border-radius:10px;
-                 font-size:0.7em;font-weight:700">score {score_label}</span>
-  </div>
-  <div style="font-size:0.75em;color:#475569;margin-bottom:5px;font-style:italic">{section}</div>
-  <div style="font-size:0.78em;color:#334155;line-height:1.55">{preview}</div>
-</div>"""
-        )
-
-    header = (
-        f"<div style='font-family:system-ui;font-weight:700;font-size:0.88em;"
-        f"color:#1e293b;margin-bottom:8px'>Sources: {len(sources)} source chunk"
-        f"{'s' if len(sources) != 1 else ''}</div>"
-    )
-    return header + "".join(cards)
 
 
 # -----------------------------Gradio streaming chat handler----------------------------------------------
 
 def respond(message: str, history: list):
-    """Generate a grounded answer and update chat + sources in one response."""
+    """Generate an answer and stream it to the chat."""
     message = message.strip()
     if not message:
-        return history, "", message
+        yield history, message
+        return
 
     try:
         ensure_kb_ready()
@@ -130,26 +76,21 @@ def respond(message: str, history: list):
             {"role": "user", "content": message},
             {"role": "assistant", "content": f"Warning: Knowledge base initialization failed: {exc}"},
         ]
-        return history, "", ""
+        yield history, ""
+        return
 
     history = history + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": ""},
     ]
 
-    sources: List[RetrievalResult] = []
-    final_text = ""
     try:
-        for partial_text, partial_sources in stream_answer_with_sources(message):
-            final_text = partial_text
-            if partial_sources is not None:
-                sources = partial_sources or []
+        for partial_text in answer_question_stream(message):
+            history[-1]["content"] = partial_text
+            yield history, ""
     except Exception as exc:
         history[-1]["content"] = f"Warning: Error generating answer: {exc}"
-        return history, "", ""
-
-    history[-1]["content"] = final_text
-    return history, build_sources_html(sources), ""
+        yield history, ""
 
 
 # --- Gradio UI ----------------------------------------------------------------
@@ -188,11 +129,6 @@ _EXAMPLE_QUESTIONS = [
     "How does RSV cause bronchiolitis in infants?",
 ]
 
-_NO_SOURCES_PLACEHOLDER = (
-    "<p style='color:#94a3b8;font-size:0.85em;font-family:system-ui;padding:8px 4px'>"
-    "Ask a question to see the knowledge-base chunks used to generate the answer.</p>"
-)
-
 
 def create_demo() -> gr.Blocks:
     """Create the Gradio Blocks app."""
@@ -213,60 +149,43 @@ def create_demo() -> gr.Blocks:
 
         gr.HTML("<hr style='border:none;border-top:1px solid #e2e8f0;margin:8px 0'>")
 
-        with gr.Row(equal_height=True):
-            with gr.Column(scale=3, min_width=420):
-                chatbot = gr.Chatbot(
-                    value=[],
-                    render_markdown=True,
-                    height=500,
-                    show_label=False,
-                    avatar_images=(None, None),
-                    placeholder=(
-                        "<div style='text-align:center;padding:40px 20px;"
-                        "color:#94a3b8;font-family:system-ui'>"
-                        "<div style='font-size:2.5em;margin-bottom:8px'>Medi LLM</div>"
-                        "<p style='font-size:0.9em'>Ask a question about respiratory viruses.</p>"
-                        "</div>"
-                    ),
-                )
+        chatbot = gr.Chatbot(
+            value=[],
+            render_markdown=True,
+            height=500,
+            show_label=False,
+            avatar_images=(None, None),
+            placeholder=(
+                "<div style='text-align:center;padding:40px 20px;"
+                "color:#94a3b8;font-family:system-ui'>"
+                "<div style='font-size:2.5em;margin-bottom:8px'>Medi LLM</div>"
+                "<p style='font-size:0.9em'>Ask a question about respiratory viruses.</p>"
+                "</div>"
+            ),
+        )
 
-                with gr.Row():
-                    msg_input = gr.Textbox(
-                        placeholder="e.g. What are the symptoms of influenza?",
-                        show_label=False,
-                        lines=1,
-                        scale=9,
-                        container=False,
-                        autofocus=True,
-                    )
-                    send_btn = gr.Button("Send ->", variant="primary", scale=2, min_width=90)
+        with gr.Row():
+            msg_input = gr.Textbox(
+                placeholder="e.g. What are the symptoms of influenza?",
+                show_label=False,
+                lines=1,
+                scale=9,
+                container=False,
+                autofocus=True,
+            )
+            send_btn = gr.Button("Send ->", variant="primary", scale=2, min_width=90)
 
-                # gr.Examples(
-                #     examples=_EXAMPLE_QUESTIONS,
-                #     inputs=msg_input,
-                #     label="Example questions",
-                #     examples_per_page=3,
-                # )
-
-                clear_btn = gr.Button("Clear conversation", variant="secondary", size="sm")
-
-            with gr.Column(scale=2, min_width=280):
-                gr.Markdown("### Retrieved Sources")
-                gr.Markdown(
-                    "<small style='color:#64748b'>Knowledge-base chunks used to generate "
-                    "the answer, ordered by cross-encoder rerank score.</small>",
-                )
-                sources_panel = gr.HTML(value=_NO_SOURCES_PLACEHOLDER)
+        clear_btn = gr.Button("Clear conversation", variant="secondary", size="sm")
 
         submit_inputs = [msg_input, chatbot]
-        submit_outputs = [chatbot, sources_panel, msg_input]
+        submit_outputs = [chatbot, msg_input]
 
-        send_btn.click(fn=respond, inputs=submit_inputs, outputs=submit_outputs, queue=False)
-        msg_input.submit(fn=respond, inputs=submit_inputs, outputs=submit_outputs, queue=False)
+        send_btn.click(fn=respond, inputs=submit_inputs, outputs=submit_outputs)
+        msg_input.submit(fn=respond, inputs=submit_inputs, outputs=submit_outputs)
 
         clear_btn.click(
-            fn=lambda: ([], _NO_SOURCES_PLACEHOLDER),
-            outputs=[chatbot, sources_panel],
+            fn=lambda: ([], ""),
+            outputs=[chatbot, msg_input],
             queue=False,
         )
 
